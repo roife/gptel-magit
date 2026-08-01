@@ -99,8 +99,11 @@ Useful options include:
   prompts.
 - =gptel-magit-body-length= for adding body line-length guidance when
   using the Conventional Commits prompt.
+- =gptel-magit-context= for controlling supplementary prompt context.
+  By default, requests contain the five most recent commit messages
+  plus the complete staged diff.  Set it to nil to omit the commit
+  history or add =:files= entries when needed.
 - =gptel-magit-model= and =gptel-magit-backend= for using a different
   model or backend just for gptel-magit requests.
 - =gptel-magit-streaming= to control whether commit messages are
   inserted incrementally as the model responds.
-
