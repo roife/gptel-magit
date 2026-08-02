@@ -36,6 +36,8 @@ Functionality is provided for:
 - Safer defaults for plain-text responses without reasoning payloads
 - A visible =Generating...= placeholder in commit buffers while the
   request is running
+- A mode-line status such as =Generating commit message...= while a
+  request is running
 - Regeneration that clears previous editable commit text while keeping
   Git's comment/instruction section intact
 
@@ -66,7 +68,8 @@ You can generate a commit message in two ways:
 
 When generation starts in a commit buffer, gptel-magit inserts a
 temporary =Generating...= hint immediately so it is obvious that the
-request is in progress. If you generate again, the previous editable
+request is in progress, and the mode line shows the request status as
+well. If you generate again, the previous editable
 message text is cleared before inserting the new result, while Magit's
 commented guidance remains untouched.
 

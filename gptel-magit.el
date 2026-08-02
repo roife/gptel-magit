@@ -196,6 +196,18 @@ See `gptel-backend` for documentation."
 (defvar-local gptel-magit--generation-overlay nil
   "Overlay used to show commit message generation progress.")
 
+(defvar-local gptel-magit--mode-line-status nil
+  "Current gptel-magit status shown in `mode-line-process'.")
+
+(defvar-local gptel-magit--mode-line-process-before-status nil
+  "Value of `mode-line-process' before gptel-magit set a status.")
+
+(defvar-local gptel-magit--mode-line-status-token nil
+  "Token identifying the request that owns the current mode-line status.")
+
+(defvar-local gptel-magit--rationale-status-buffer nil
+  "Buffer whose mode line should show status for rationale requests.")
+
 
 (defun gptel-magit-set-commit-style (style-name)
   "Set `gptel-magit-commit-prompt` from STYLE-NAME.
@@ -228,6 +240,38 @@ STYLE-NAME must exist in `gptel-magit-commit-styles-alist`."
   "Display an error message derived from request INFO."
   (message "gptel-magit error: %s"
            (or (plist-get info :status) "unknown status")))
+
+(defun gptel-magit--set-mode-line-status (buffer status &optional token)
+  "Show STATUS in BUFFER's `mode-line-process'.
+
+When STATUS is nil, restore the value that was present before the
+request started.  TOKEN prevents an older overlapping request from
+clearing the status belonging to a newer request."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (if status
+          (progn
+            (unless gptel-magit--mode-line-status
+              (setq gptel-magit--mode-line-process-before-status
+                    mode-line-process))
+            (setq gptel-magit--mode-line-status status
+                  gptel-magit--mode-line-status-token token
+                  mode-line-process
+                  (let ((entry (propertize (concat " " status)
+                                           'face 'mode-line-emphasis)))
+                    (if gptel-magit--mode-line-process-before-status
+                        (list gptel-magit--mode-line-process-before-status
+                              entry)
+                      entry))))
+        (when (and gptel-magit--mode-line-status
+                   (or (null token)
+                       (eq token gptel-magit--mode-line-status-token)))
+          (setq mode-line-process
+                gptel-magit--mode-line-process-before-status
+                gptel-magit--mode-line-process-before-status nil
+                gptel-magit--mode-line-status nil
+                gptel-magit--mode-line-status-token nil)))
+      (force-mode-line-update t))))
 
 
 ;;; Context building
@@ -397,23 +441,52 @@ Return markers around generated text."
     (goto-char start-marker)
     (gptel-magit--insert-commit-message message)))
 
-(defun gptel-magit--request (&rest args)
-  "Call `gptel-request` with ARGS.
+(defun gptel-magit--request (status-buffer status &rest args)
+  "Call `gptel-request` with ARGS and display STATUS in STATUS-BUFFER.
 
 Respects configured model/backend options."
-  (declare (indent 1))
+  (declare (indent 2))
   (let* ((gptel-backend (or gptel-magit-backend gptel-backend))
          (gptel-model (or gptel-magit-model gptel-model))
-         (gptel-include-reasoning 'ignore))
-    (apply #'gptel-request args)))
+         (gptel-include-reasoning 'ignore)
+         (callback (plist-get (cdr args) :callback))
+         (status-token (and status-buffer
+                            (make-symbol "gptel-magit-status"))))
+    (when (and status-buffer status callback)
+      (gptel-magit--set-mode-line-status
+       status-buffer status status-token)
+      (setq args
+            (cons (car args)
+                  (plist-put
+                   (copy-sequence (cdr args))
+                   :callback
+                   (lambda (response info)
+                     (unwind-protect
+                         (funcall callback response info)
+                       ;; A streamed text chunk, reasoning chunk, or tool
+                       ;; message is not the end of the request yet.
+                       (when (or (eq response t)
+                                 (null response)
+                                 (eq response 'abort)
+                                 (and (stringp response)
+                                      (not (plist-get info :stream))))
+                         (gptel-magit--set-mode-line-status
+                          status-buffer nil status-token))))))))
+    (condition-case error-data
+        (apply #'gptel-request args)
+      (error
+       (gptel-magit--set-mode-line-status
+        status-buffer nil status-token)
+       (signal (car error-data) (cdr error-data))))))
 
-(defun gptel-magit--generate (callback &optional rationale)
+(defun gptel-magit--generate
+    (callback &optional rationale status-buffer status)
   "Generate a commit message for current magit repo.
 Invokes CALLBACK with the generated message when done.
 
 Every request includes the complete staged diff and the sources in
 `gptel-magit-context'.  Optional RATIONALE explains why the change
-was made."
+was made.  STATUS-BUFFER shows STATUS while the request is running."
   (let* ((diff (magit-git-output "diff" "--cached"))
          (extra (gptel-magit--build-context))
          (prompt (concat
@@ -431,7 +504,9 @@ was made."
          (acc "")
          (commit-message-cleared nil)
          (start-marker nil)
-         (end-marker nil))
+         (end-marker nil)
+         (status-buffer (or status-buffer commit-buffer))
+         (status (or status "Generating commit message...")))
     (when commit-buffer
       (with-current-buffer commit-buffer
         (save-excursion
@@ -439,7 +514,7 @@ was made."
             (setq start-marker (car markers))
             (setq end-marker (cdr markers))
             (setq commit-message-cleared t)))))
-    (gptel-magit--request prompt
+    (gptel-magit--request status-buffer status prompt
       :system (gptel-magit--get-commit-prompt)
       :context nil
       :stream gptel-magit-streaming
@@ -509,7 +584,9 @@ was made."
                                (with-current-buffer buffer
                                  (save-excursion
                                    (gptel-magit--replace-commit-message
-                                    message)))))))
+                                    message))))))
+                           nil (current-buffer)
+                           "Generating commit message...")
   (message "magit-gptel: Generating commit message..."))
 
 (defun gptel-magit-commit-generate (&optional args)
@@ -518,7 +595,8 @@ Uses ARGS from transient mode."
   (interactive (list (magit-commit-arguments)))
   (gptel-magit--generate
    (lambda (message)
-     (magit-commit-create (append args `("--message" ,message "--edit")))))
+     (magit-commit-create (append args `("--message" ,message "--edit"))))
+   nil (current-buffer) "Generating commit...")
   (message "magit-gptel: Generating commit..."))
 
 (defun gptel-magit--show-diff-explain (text)
@@ -537,17 +615,18 @@ Uses ARGS from transient mode."
 
 (defun gptel-magit--do-diff-request (diff)
   "Send request for an explanation of DIFF."
-  (gptel-magit--request diff
-    :system gptel-magit-diff-explain-prompt
-    :context nil
-    :callback (lambda (response info)
-                (cond
-                 ((stringp response)
-                  (gptel-magit--show-diff-explain response))
-                 ((and (consp response) (eq (car response) 'reasoning))
-                  nil)
-                 ((or (null response) (eq response 'abort))
-                  (gptel-magit--request-error info)))))
+  (let ((status-buffer (current-buffer)))
+    (gptel-magit--request status-buffer "Explaining diff..." diff
+      :system gptel-magit-diff-explain-prompt
+      :context nil
+      :callback (lambda (response info)
+                  (cond
+                   ((stringp response)
+                    (gptel-magit--show-diff-explain response))
+                   ((and (consp response) (eq (car response) 'reasoning))
+                    nil)
+                   ((or (null response) (eq response 'abort))
+                    (gptel-magit--request-error info))))))
   (message "magit-gptel: Explaining diff..."))
 
 (defun gptel-magit-diff-explain (&optional arg)
@@ -598,7 +677,10 @@ Uses ARGS from transient mode."
 (defun gptel-magit--submit-rationale ()
   "Submit the rationale buffer and generate a commit message."
   (interactive)
-  (let ((rationale (gptel-magit--rationale-text)))
+  (let ((rationale (gptel-magit--rationale-text))
+        (status-buffer (or gptel-magit--current-commit-buffer
+                           gptel-magit--rationale-status-buffer
+                           (current-buffer))))
     (quit-window t)
     (gptel-magit--generate
      (lambda (message)
@@ -606,7 +688,7 @@ Uses ARGS from transient mode."
          (with-current-buffer gptel-magit--current-commit-buffer
            (save-excursion
              (gptel-magit--replace-commit-message message)))))
-     rationale)
+     rationale status-buffer "Generating commit message with rationale...")
     (message "magit-gptel: Generating commit message with rationale...")))
 
 
@@ -626,6 +708,8 @@ Uses ARGS from transient mode."
   (let ((buffer (get-buffer-create gptel-magit-rationale-buffer)))
     (with-current-buffer buffer
       (gptel-magit-rationale-mode)
+      (setq gptel-magit--rationale-status-buffer
+            gptel-magit--current-commit-buffer)
       (gptel-magit--setup-rationale-buffer))
     (pop-to-buffer buffer)))
 
@@ -636,9 +720,11 @@ Uses ARGS from transient mode."
 Uses ARGS from transient mode."
   (interactive (list (magit-commit-arguments)))
   (setq gptel-magit--current-commit-buffer nil)
-  (let ((buffer (get-buffer-create gptel-magit-rationale-buffer)))
+  (let ((buffer (get-buffer-create gptel-magit-rationale-buffer))
+        (status-buffer (current-buffer)))
     (with-current-buffer buffer
       (gptel-magit-rationale-mode)
+      (setq gptel-magit--rationale-status-buffer status-buffer)
       (gptel-magit--setup-rationale-buffer)
       (local-set-key
        (kbd "C-c C-c")
@@ -650,7 +736,7 @@ Uses ARGS from transient mode."
             (lambda (message)
               (magit-commit-create
                (append args `("--message" ,message "--edit"))))
-            rationale)
+            rationale status-buffer "Generating commit with rationale...")
            (message "magit-gptel: Generating commit with rationale...")))))
     (pop-to-buffer buffer)))
 
